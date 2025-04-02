@@ -1,0 +1,95 @@
+#!/bin/bash
+set -euxo pipefail
+
+# 🔧 VARIABLES
+AWS_REGION="${aws_region}"
+VAULT_BUCKET="${bucket_name}"
+KMS_KEY_ID="${kms_key_id}"
+VAULT_VERSION="${VAULT_VERSION}"
+
+# 🐳 Instalar Docker y herramientas necesarias
+amazon-linux-extras install docker -y
+yum install -y aws-cli jq ec2-instance-connect unzip
+systemctl enable docker || true
+systemctl start docker
+usermod -aG docker ec2-user || true
+
+# 🧱 Instalar Docker Compose (v2.20.2) y symlink global
+curl -L "https://github.com/docker/compose/releases/download/v2.20.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
+ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+docker-compose version
+
+# 📦 Instalar Vault CLI y configurar PATH
+curl -sLo vault.zip https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip
+unzip vault.zip
+mv vault /usr/local/bin/vault
+echo 'export PATH=$PATH:/usr/local/bin' >> /root/.bashrc
+chmod +x /usr/local/bin/vault
+rm vault.zip
+vault --version
+
+# 🛰️ Activar SSM Agent
+yum install -y https://s3.${aws_region}.amazonaws.com/amazon-ssm-${aws_region}/latest/linux_amd64/amazon-ssm-agent.rpm || true
+systemctl enable amazon-ssm-agent || true
+systemctl start amazon-ssm-agent || true
+
+# 📁 Crear estructura para Vault
+mkdir -p /opt/vault/config /opt/vault/tls || true
+
+# 🔐 TLS autofirmado
+openssl req -new -x509 -days 365 -nodes \
+  -out /opt/vault/tls/vault.crt \
+  -keyout /opt/vault/tls/vault.key \
+  -subj "/CN=vault"
+
+# ⚙️ Configuración de Vault
+cat > /opt/vault/config/vault.hcl <<EOF
+storage "s3" {
+  bucket     = "${bucket_name}"
+  region     = "${aws_region}"
+}
+
+seal "awskms" {
+  region     = "${aws_region}"
+  kms_key_id = "${kms_key_id}"
+}
+
+listener "tcp" {
+  address       = "0.0.0.0:8200"
+  tls_cert_file = "/vault/tls/vault.crt"
+  tls_key_file  = "/vault/tls/vault.key"
+}
+
+ui = true
+EOF
+
+# 🧱 Compose file
+cat > /opt/vault/docker-compose.yml <<EOF
+version: '3.7'
+services:
+  vault:
+    image: hashicorp/vault:latest
+    container_name: vault
+    restart: always
+    network_mode: host
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - /opt/vault/config:/vault/config
+      - /opt/vault/tls:/vault/tls
+    command: vault server -config=/vault/config/vault.hcl
+EOF
+
+# ⚙️ Permitir acceso sin sudo
+chmod 666 /var/run/docker.sock || true
+
+# 🚀 Lanzar Vault
+docker-compose -f /opt/vault/docker-compose.yml up -d
+
+# 🔐 Inicializar Vault y guardar en Secrets Manager
+export VAULT_ADDR=https://127.0.0.1:8200
+export VAULT_SKIP_VERIFY=true
+sleep 10
+vault operator init -key-shares=1 -key-threshold=1 > /tmp/init.txt
+aws secretsmanager create-secret --region ${aws_region} --name vault-init-output --secret-string file:///tmp/init.txt || true
